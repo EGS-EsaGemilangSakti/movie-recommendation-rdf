@@ -41,6 +41,7 @@ g.add((ex.Country, RDF.type, RDFS.Class))
 
 # Define Properties
 properties = [
+    (ex.movie_id, ex.Movie, XSD.integer),
     (ex.title, ex.Movie, XSD.string),
     (ex.overview, ex.Movie, XSD.string),
     (ex.runtime, ex.Movie, XSD.decimal),
@@ -50,6 +51,7 @@ properties = [
     (ex.vote_average, ex.Movie, XSD.decimal),
     (ex.vote_count, ex.Movie, XSD.integer),
     (ex.original_language, ex.Movie, XSD.string),
+    (ex.genre, ex.Movie, XSD.string),
     (ex.directedBy, ex.Movie, ex.Director),
     (ex.hasActor, ex.Movie, ex.Actor),
     (ex.producedIn, ex.Movie, ex.Country),
@@ -76,6 +78,7 @@ for prop, domain, range_ in properties:
 for _, row in movies.iterrows():
     movie_uri = create_uri(ex.Movie, str(row["movie_id"]))
     g.add((movie_uri, RDF.type, ex.Movie))
+    g.add((movie_uri, ex.movie_id, Literal(row["movie_id"], datatype=XSD.integer)))
     g.add((movie_uri, ex.title, Literal(row["title"], datatype=XSD.string)))
     g.add((movie_uri, ex.overview, Literal(row["overview"], datatype=XSD.string)))
     g.add((movie_uri, ex.runtime, Literal(row["runtime"], datatype=XSD.float)))

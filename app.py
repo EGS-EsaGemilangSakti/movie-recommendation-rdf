@@ -1,8 +1,20 @@
 import streamlit as st
 from SPARQLWrapper import SPARQLWrapper, JSON
-from urllib.parse import unquote
+from pathlib import Path
+from rdflib import Literal
+from rdflib.namespace import XSD
+import os
 import pickle
+import pandas as pd
 import requests
+
+PROJECT_DIR = Path(__file__).resolve().parent
+SPARQL_ENDPOINT = os.getenv(
+    "SPARQL_ENDPOINT",
+    "http://localhost:3030/movies/sparql",
+)
+TMDB_API_KEY = os.getenv("TMDB_API_KEY")
+PLACEHOLDER_POSTER = "https://placehold.co/500x750?text=No+Image+Available"
 
 # Set page configuration
 st.set_page_config(
@@ -53,32 +65,74 @@ footer = """
 st.markdown(footer, unsafe_allow_html=True)
 
 # TMDB Poster API
+@st.cache_data(show_spinner=False)
 def fetch_poster(movie_id):
-    url = f"https://api.themoviedb.org/3/movie/{movie_id}?api_key=8bb921015d2d20ee4b1b630ac130a216&language=en-US"
+    if not TMDB_API_KEY or not movie_id:
+        return PLACEHOLDER_POSTER
+
+    url = f"https://api.themoviedb.org/3/movie/{movie_id}"
     try:
-        data = requests.get(url).json()
+        response = requests.get(
+            url,
+            params={"api_key": TMDB_API_KEY, "language": "en-US"},
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
         poster_path = data.get("poster_path")
         if poster_path:
-            full_path = f"http://image.tmdb.org/t/p/w500{poster_path}"
-            return full_path
-        else:
-            return "https://via.placeholder.com/500x750?text=No+Image+Available"
-    except requests.exceptions.RequestException as e:
-        st.error(f"Error fetching poster: {e}")
-        return "https://via.placeholder.com/500x750?text=No+Image+Available"
+            return f"https://image.tmdb.org/t/p/w500{poster_path}"
+    except (requests.exceptions.RequestException, ValueError):
+        pass
+
+    return PLACEHOLDER_POSTER
 
 # SPARQL Wrapper for Fuseki
-sparql = SPARQLWrapper("http://localhost:3030/movies/sparql")
-
 def run_sparql_query(query):
-    sparql.setQuery(query)
-    sparql.setReturnFormat(JSON)
-    results = sparql.query().convert()
-    return results["results"]["bindings"]
+    try:
+        sparql = SPARQLWrapper(SPARQL_ENDPOINT)
+        sparql.setQuery(query)
+        sparql.setReturnFormat(JSON)
+        sparql.setTimeout(15)
+        results = sparql.query().convert()
+        return results["results"]["bindings"]
+    except Exception:
+        st.error(
+            "Tidak dapat menjalankan query SPARQL. Pastikan Fuseki aktif, "
+            "dataset `movies` tersedia, dan endpoint berikut dapat diakses: "
+            f"`{SPARQL_ENDPOINT}`."
+        )
+        return []
+
+def sparql_string(value):
+    """Return a safely escaped xsd:string literal for a SPARQL query."""
+    return Literal(str(value), datatype=XSD.string).n3()
+
+def binding_value(binding, key, default="N/A"):
+    return binding.get(key, {}).get("value", default)
 
 # Load pre-processed movie data
-movies = pickle.load(open("movie_list.pkl", "rb"))
-movie_list = movies["title"].values
+movie_cache = PROJECT_DIR / "movie_list.pkl"
+movie_csv = PROJECT_DIR / "Datasets" / "Movies_less.csv"
+
+if movie_cache.exists():
+    with movie_cache.open("rb") as file:
+        movies = pickle.load(file)
+else:
+    movies = pd.read_csv(movie_csv, usecols=["title"])
+    st.info(
+        "`movie_list.pkl` belum tersedia; daftar judul dibaca langsung dari "
+        "`Datasets/Movies_less.csv`. Jalankan `python generate_movie_list.py` "
+        "untuk membuat cache."
+    )
+
+movie_list = (
+    pd.Series(movies["title"])
+    .dropna()
+    .drop_duplicates()
+    .sort_values()
+    .to_numpy()
+)
 
 # Radio button to choose between searching for a movie or selecting a question
 option = st.radio(
@@ -92,15 +146,17 @@ if option == "Search for a Movie":
 
     # Show results button
     if st.button("Show Results"):
+        title_literal = sparql_string(movie_title)
+
         # SPARQL query for movie details
         movie_query = f"""
         PREFIX ex: <http://example.org/movies#>
-        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 
-        SELECT ?title ?overview ?release_date ?runtime ?budget ?revenue ?director ?movie_id ?actor_name ?country ?language ?genre
+        SELECT ?title ?overview ?release_date ?runtime ?budget ?revenue
+               ?director ?director_name ?movie_id ?actor_name
+               ?country ?country_name ?language ?genre
         WHERE {{
-            ?movie ex:title "{movie_title}"^^xsd:string ;
+            ?movie ex:title {title_literal} ;
                 ex:overview ?overview ;
                 ex:release_date ?release_date ;
                 ex:runtime ?runtime ;
@@ -110,9 +166,18 @@ if option == "Search for a Movie":
                 ex:hasActor ?actor ;
                 ex:producedIn ?country ;
                 ex:original_language ?language ;
-                ex:genre ?genre ;
-                ex:movie_id ?movie_id .
+                ex:genre ?genre .
             ?actor ex:title ?actor_name .
+            OPTIONAL {{ ?director ex:title ?director_name . }}
+            OPTIONAL {{ ?country ex:title ?country_name . }}
+            OPTIONAL {{ ?movie ex:movie_id ?stored_movie_id . }}
+            BIND(
+                IF(
+                    BOUND(?stored_movie_id),
+                    STR(?stored_movie_id),
+                    STRAFTER(STR(?movie), "#Movie")
+                ) AS ?movie_id
+            )
         }}
         """
 
@@ -122,26 +187,23 @@ if option == "Search for a Movie":
             movie = movie_data[0]
 
             # Display movie details
-            movie_id = movie.get('movie_id', {}).get('value', None)
-            poster_url = fetch_poster(movie_id) if movie_id else "https://via.placeholder.com/500x750?text=No+Image+Available"
+            movie_id = binding_value(movie, "movie_id", None)
+            poster_url = fetch_poster(movie_id)
 
             # Two-column layout for poster and details
             col1, col2 = st.columns([1, 2])
             with col1:
-                st.image(poster_url, use_column_width=True)
+                st.image(poster_url, width="stretch")
             with col2:
                 st.markdown(f"### {movie_title}")
-                st.write(f"**Overview**: {movie.get('overview', {}).get('value', 'N/A')}")
-                st.write(f"**Release Date**: {movie.get('release_date', {}).get('value', 'N/A')}")
-                st.write(f"**Runtime**: {movie.get('runtime', {}).get('value', 'N/A')} minutes")
-                st.write(f"**Budget**: ${movie.get('budget', {}).get('value', 'N/A')}")
-                st.write(f"**Revenue**: ${movie.get('revenue', {}).get('value', 'N/A')}")
-                director_uri = movie.get('director', {}).get('value', 'N/A')
-                if director_uri != 'N/A':
-                    director_name = unquote(director_uri.split('Director')[-1].replace('_', ' ').strip())
-                    st.write(f"**Director**: {director_name}")
-                else:
-                    st.write("**Director**: N/A")
+                st.write(f"**Overview**: {binding_value(movie, 'overview')}")
+                st.write(f"**Release Date**: {binding_value(movie, 'release_date')}")
+                st.write(f"**Runtime**: {binding_value(movie, 'runtime')} minutes")
+                st.write(f"**Budget**: ${binding_value(movie, 'budget')}")
+                st.write(f"**Revenue**: ${binding_value(movie, 'revenue')}")
+                director_uri = binding_value(movie, "director")
+                director_name = binding_value(movie, "director_name")
+                st.write(f"**Director**: {director_name}")
                     
                 actor_names = set()    
                 for i in range(len(movie_data)):
@@ -172,16 +234,14 @@ if option == "Search for a Movie":
                 else:
                     st.write(f"**Actors**: N/A")
 
-                country_url = movie.get('country', {}).get('value', 'N/A')
-                if country_url != 'N/A':
-                    country_name = country_url.split('/')[-1].replace('%20', ' ')
-                    if country_name.startswith('Country'):
-                        country_name = country_name.replace('Country', '').strip()
-                else:
-                    country_name = 'N/A'
-
-                st.write(f"**Country**: {country_name}")
-                st.write(f"**Language**: {movie.get('language', {}).get('value', 'N/A')}")
+                country_names = {
+                    binding_value(item, "country_name")
+                    for item in movie_data
+                    if binding_value(item, "country_name") != "N/A"
+                }
+                countries_text = ", ".join(sorted(country_names)) or "N/A"
+                st.write(f"**Country**: {countries_text}")
+                st.write(f"**Language**: {binding_value(movie, 'language')}")
                 
                 genre_names = set()  
                 for i in range(len(movie_data)):
@@ -210,16 +270,21 @@ if option == "Search for a Movie":
             st.subheader(":orange[Recommendations by Director]")
             director_query = f"""
             PREFIX ex: <http://example.org/movies#>
-            PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-            PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 
             SELECT ?title ?overview ?movie_id
             WHERE {{
                 ?movie ex:title ?title ;
                        ex:overview ?overview ;
-                       ex:directedBy <{director_uri}> ;
-                       ex:movie_id ?movie_id .
-                FILTER(?title != "{movie_title}"^^xsd:string)
+                       ex:directedBy <{director_uri}> .
+                OPTIONAL {{ ?movie ex:movie_id ?stored_movie_id . }}
+                BIND(
+                    IF(
+                        BOUND(?stored_movie_id),
+                        STR(?stored_movie_id),
+                        STRAFTER(STR(?movie), "#Movie")
+                    ) AS ?movie_id
+                )
+                FILTER(?title != {title_literal})
             }}
             LIMIT 5
             """
@@ -231,7 +296,7 @@ if option == "Search for a Movie":
                     movie_name = recommendation.get("title", {}).get("value", "N/A")
                     overview = recommendation.get("overview", {}).get("value", "N/A")
                     rec_movie_id = recommendation.get("movie_id", {}).get("value", None)
-                    rec_poster = fetch_poster(rec_movie_id) if rec_movie_id else "https://via.placeholder.com/500x750?text=No+Image+Available"
+                    rec_poster = fetch_poster(rec_movie_id)
                     with cols[i]:
                         st.image(rec_poster, width=200)
                         st.write(f"**{movie_name}**")
@@ -244,18 +309,23 @@ if option == "Search for a Movie":
             st.subheader(":orange[Recommendations by Actor]")
             actor_query = f"""
             PREFIX ex: <http://example.org/movies#>
-            PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-            PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 
             SELECT DISTINCT ?title ?overview ?movie_id
             WHERE {{
-                ?movie ex:title "{movie_title}"^^xsd:string ;
+                ?movie ex:title {title_literal} ;
                        ex:hasActor ?actor .
                 ?other_movie ex:hasActor ?actor ;
                             ex:title ?title ;
-                            ex:overview ?overview ;
-                            ex:movie_id ?movie_id .
-                FILTER(?title != "{movie_title}"^^xsd:string)
+                            ex:overview ?overview .
+                OPTIONAL {{ ?other_movie ex:movie_id ?stored_movie_id . }}
+                BIND(
+                    IF(
+                        BOUND(?stored_movie_id),
+                        STR(?stored_movie_id),
+                        STRAFTER(STR(?other_movie), "#Movie")
+                    ) AS ?movie_id
+                )
+                FILTER(?title != {title_literal})
             }}
             LIMIT 5
             """
@@ -267,11 +337,13 @@ if option == "Search for a Movie":
                     movie_name = recommendation.get("title", {}).get("value", "N/A")
                     overview = recommendation.get("overview", {}).get("value", "N/A")
                     rec_movie_id = recommendation.get("movie_id", {}).get("value", None)
-                    rec_poster = fetch_poster(rec_movie_id) if rec_movie_id else "https://via.placeholder.com/500x750?text=No+Image+Available"
+                    rec_poster = fetch_poster(rec_movie_id)
                     with cols[i]:
                         st.image(rec_poster, width=200)
                         st.write(f"**{movie_name}**")
                         st.caption(overview)
+            else:
+                st.write("No recommendations available for the actors.")
 
         else:
             st.error("Movie not found!")
@@ -298,8 +370,15 @@ elif option == "Select a Predefined Question":
             SELECT ?title ?budget ?movie_id
             WHERE {
                 ?movie ex:title ?title ;
-                       ex:budget ?budget ;
-                       ex:movie_id ?movie_id .
+                       ex:budget ?budget .
+                OPTIONAL { ?movie ex:movie_id ?stored_movie_id . }
+                BIND(
+                    IF(
+                        BOUND(?stored_movie_id),
+                        STR(?stored_movie_id),
+                        STRAFTER(STR(?movie), "#Movie")
+                    ) AS ?movie_id
+                )
             }
             ORDER BY DESC(?budget)
             LIMIT 10
@@ -313,8 +392,15 @@ elif option == "Select a Predefined Question":
             SELECT ?title ?runtime ?movie_id
             WHERE {
                 ?movie ex:title ?title ;
-                       ex:runtime ?runtime ;
-                       ex:movie_id ?movie_id .
+                       ex:runtime ?runtime .
+                OPTIONAL { ?movie ex:movie_id ?stored_movie_id . }
+                BIND(
+                    IF(
+                        BOUND(?stored_movie_id),
+                        STR(?stored_movie_id),
+                        STRAFTER(STR(?movie), "#Movie")
+                    ) AS ?movie_id
+                )
             }
             ORDER BY DESC(?runtime)
             LIMIT 10
@@ -328,8 +414,15 @@ elif option == "Select a Predefined Question":
             SELECT ?title ?revenue ?movie_id
             WHERE {
                 ?movie ex:title ?title ;
-                       ex:revenue ?revenue ;
-                       ex:movie_id ?movie_id .
+                       ex:revenue ?revenue .
+                OPTIONAL { ?movie ex:movie_id ?stored_movie_id . }
+                BIND(
+                    IF(
+                        BOUND(?stored_movie_id),
+                        STR(?stored_movie_id),
+                        STRAFTER(STR(?movie), "#Movie")
+                    ) AS ?movie_id
+                )
             }
             ORDER BY DESC(?revenue)
             LIMIT 10
@@ -354,11 +447,12 @@ elif option == "Select a Predefined Question":
             PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
             PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 
-            SELECT ?country (COUNT(?country) AS ?count)
+            SELECT ?country ?country_name (COUNT(?country) AS ?count)
             WHERE {
                 ?movie ex:producedIn ?country .
+                ?country ex:title ?country_name .
             }
-            GROUP BY ?country
+            GROUP BY ?country ?country_name
             ORDER BY DESC(?count)
             LIMIT 10
             """
@@ -371,8 +465,15 @@ elif option == "Select a Predefined Question":
             SELECT ?title (COUNT(?country) AS ?country_count) ?movie_id
             WHERE {
                 ?movie ex:title ?title ;
-                       ex:producedIn ?country ;
-                       ex:movie_id ?movie_id .
+                       ex:producedIn ?country .
+                OPTIONAL { ?movie ex:movie_id ?stored_movie_id . }
+                BIND(
+                    IF(
+                        BOUND(?stored_movie_id),
+                        STR(?stored_movie_id),
+                        STRAFTER(STR(?movie), "#Movie")
+                    ) AS ?movie_id
+                )
             }
             GROUP BY ?title ?movie_id
             ORDER BY DESC(?country_count)
@@ -382,28 +483,32 @@ elif option == "Select a Predefined Question":
         results = run_sparql_query(query)
 
         if results:
-            # Handling Top 10 Results
-            rows = 2  # Two rows of results
-            cols = st.columns(5)  # Each row contains a maximum of 5 movies
+            cols = st.columns(5)
 
-            for row_idx in range(rows):
-                for col_idx in range(5):
-                    index = row_idx * 5 + col_idx
-                    if index < len(results):
-                        result = results[index]
-                        movie_name = result.get("title", {}).get("value", "N/A")
-                        movie_id = result.get("movie_id", {}).get("value", None)
-                        poster_url = fetch_poster(movie_id) if movie_id else "https://via.placeholder.com/500x750?text=No+Image+Available"
+            for index, result in enumerate(results):
+                with cols[index % 5]:
+                    if "genre" in result:
+                        st.write(f"**{binding_value(result, 'genre')}**")
+                        st.write(f"Jumlah film: {binding_value(result, 'count')}")
+                    elif "country" in result and "title" not in result:
+                        st.write(f"**{binding_value(result, 'country_name')}**")
+                        st.write(f"Jumlah film: {binding_value(result, 'count')}")
+                    else:
+                        movie_name = binding_value(result, "title")
+                        movie_id = binding_value(result, "movie_id", None)
+                        st.image(fetch_poster(movie_id), width=200)
+                        st.write(f"**{movie_name}**")
 
-                        # Check if the result contains a count (like genre or country)
-                        if "count" in result:
-                            count_value = result["count"]["value"]
-                            with cols[col_idx]:
-                                st.write(f"**{movie_name}**")
-                                st.write(f"Count: {count_value}")
-                        else:
-                            with cols[col_idx]:
-                                st.image(poster_url, width=200)
-                                st.write(f"**{movie_name}**")
+                        if "budget" in result:
+                            st.write(f"Budget: ${binding_value(result, 'budget')}")
+                        elif "runtime" in result:
+                            st.write(f"Runtime: {binding_value(result, 'runtime')} menit")
+                        elif "revenue" in result:
+                            st.write(f"Revenue: ${binding_value(result, 'revenue')}")
+                        elif "country_count" in result:
+                            st.write(
+                                "Jumlah negara: "
+                                f"{binding_value(result, 'country_count')}"
+                            )
         else:
             st.write("No results found for the selected question.")
