@@ -33,7 +33,7 @@ A semantic web-based movie recommendation system that leverages RDF (Resource De
 
 ### Prerequisites
 
-- Python 3.8+
+- Python 3.14
 - pip package manager
 
 ### Setup
@@ -48,14 +48,15 @@ cd movie-recommendation-rdf
 2. **Create a virtual environment**
 
 ```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+python3.14 -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 ```
 
 3. **Install dependencies**
 
 ```bash
-pip install -r requirements.txt
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
 ## 📦 Dependencies
@@ -69,7 +70,7 @@ pip install -r requirements.txt
 Install all dependencies:
 
 ```bash
-pip install streamlit rdflib SPARQLWrapper pandas isodate
+python -m pip install -r requirements.txt
 ```
 
 ## 🚀 Usage
